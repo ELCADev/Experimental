@@ -1,10 +1,11 @@
-﻿namespace CheckoutAuthCodeGrant
-{
-    using System.Net;
-    using System.Net.Http;
-    using System.Net.Http.Headers;
-    using System.Threading.Tasks;
+﻿using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
 
+namespace CheckoutAuthCodeGrant
+{
     /// <summary>
     /// Issues requests from this application to the Payments API.
     /// </summary>
@@ -132,8 +133,11 @@
                     AuthorizationToken = token
                 };
 
-                return await client.PostAsJsonAsync(url, body);
-            }
-        }
+				var jsonContent = JsonConvert.SerializeObject(body);
+				var content = new StringContent(jsonContent, System.Text.Encoding.UTF8, "application/json");
+
+				return await client.PostAsync(url, content);
+			}
+		}
     }
 }

@@ -82,11 +82,11 @@ namespace CheckoutAuthCodeGrant.Controls
 
 			if (string.IsNullOrEmpty(model.SelectedPaymentConfigurationId))
 			{
-				model.SelectedPaymentConfigurationId = validPaymentConfigurations.Where(pc => pc.ProcessMode != "Live").First().Id;
+				model.SelectedPaymentConfigurationId = validPaymentConfigurations.First(pc => pc.ProcessMode != "Live").Id;
 			}
 		}
 
-		public async Task SubmitButton_Click(String Amount, String TokenField)
+		public async Task SubmitCheckout(String Amount, String TokenField)
 		{
 			try
 			{

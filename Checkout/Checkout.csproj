@@ -95,6 +95,15 @@
     <Content Include="Scripts\knockout.validation.min.js.map" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="TokenContext.cs" />
+    <Compile Include="TokenManager.ascx.designer.cs">
+      <DependentUpon>TokenManager.ascx</DependentUpon>
+    </Compile>
+    <Content Include="TokenManager.ascx" />
+    <Compile Include="TokenManager.ascx.cs">
+      <DependentUpon>TokenManager.ascx</DependentUpon>
+      <SubType>ASPXCodeBehind</SubType>
+    </Compile>
     <Compile Include="Configuration.cs" />
     <Compile Include="Controls\Checkout.cs" />
     <Compile Include="Default.aspx.cs">

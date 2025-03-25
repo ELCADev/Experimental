@@ -1,6 +1,8 @@
-﻿using System;
+﻿using Newtonsoft.Json;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
@@ -10,7 +12,7 @@ namespace TokenManagement
 	/// <summary>
 	/// Single principal token manager that handles token access for anonymous visitors
 	/// </summary>
-	public class AnonymousPrincipal
+	public class AnonymousPrincipal : IDisposable
 	{
 		private static readonly Lazy<AnonymousPrincipal> _instance = new Lazy<AnonymousPrincipal>(() => new AnonymousPrincipal());
 		public static AnonymousPrincipal Instance => _instance.Value;
@@ -21,7 +23,48 @@ namespace TokenManagement
 		// Dictionary mapping visitor ID to their token allocation
 		private readonly ConcurrentDictionary<string, VisitorTokens> _visitorTokens = new ConcurrentDictionary<string, VisitorTokens>();
 
-		private AnonymousPrincipal() { }
+		// Default backup file path
+		private readonly string _backupFilePath;
+		private readonly Timer _backupTimer;
+		private readonly object _backupLock = new object();
+		private int _backupInProgress = 0;
+
+		// Constructor modification
+		private AnonymousPrincipal()
+		{
+			// Set default backup file path in App_Data folder
+			_backupFilePath = Path.Combine(
+				HttpContext.Current?.Server?.MapPath("~/App_Data") ?? ".",
+				"token_backup.json");
+
+			// Load any existing tokens from backup
+			RestoreTokensFromBackup();
+
+			// Start periodic backup every 5 minutes
+			_backupTimer = new Timer(BackupTimerCallback, null,
+				TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+		}
+
+		/// <summary>
+		/// Token backup data structure for serialization
+		/// </summary>
+		public class TokenBackupData
+		{
+			public Dictionary<string, TokenData> Tokens { get; set; } = new Dictionary<string, TokenData>();
+			public DateTime BackupTime { get; set; } = DateTime.UtcNow;
+		}
+
+		/// <summary>
+		/// Serializable token data
+		/// </summary>
+		public class TokenData
+		{
+			public string TokenType { get; set; }
+			public string Value { get; set; }
+			public DateTime ExpiresAt { get; set; }
+			public Dictionary<string, object> RefreshParameters { get; set; } = new Dictionary<string, object>();
+			public int UsageCount { get; set; }
+		}
 
 		/// <summary>
 		/// Represents a shared token used by multiple anonymous visitors
@@ -146,7 +189,7 @@ namespace TokenManagement
 		}
 
 		/// <summary>
-		/// Initialize a token by fetching it from the server
+		/// Initialize a token by fetching it from the server, to trigger backup after successful initialization
 		/// </summary>
 		private async Task InitializeToken(string tokenType)
 		{
@@ -178,6 +221,9 @@ namespace TokenManagement
 						token.IsRefreshing = false;
 						token.IsInvalid = false;
 					}
+
+					// Backup after successful initialization
+					BackupTokensToFile();
 				}
 				catch (Exception ex)
 				{
@@ -268,7 +314,7 @@ namespace TokenManagement
 		}
 
 		/// <summary>
-		/// Actually perform the token refresh
+		/// Actually perform the token refresh, adding backup
 		/// </summary>
 		private async Task PerformTokenRefresh(string tokenType)
 		{
@@ -300,6 +346,9 @@ namespace TokenManagement
 						token.Value = newTokenValue;
 						token.ExpiresAt = result.ExpiresAt;
 					}
+
+					// Backup tokens after successful refresh
+					BackupTokensToFile();
 				}
 				else
 				{
@@ -463,6 +512,173 @@ namespace TokenManagement
 				UnregisterVisitor(visitorId);
 			}
 		}
+
+		/// <summary>
+		/// Timer callback to periodically backup tokens
+		/// </summary>
+		private void BackupTimerCallback(object state)
+		{
+			BackupTokensToFile();
+		}
+
+		/// <summary>
+		/// Backup all current tokens to a file
+		/// </summary>
+		public void BackupTokensToFile(string customPath = null)
+		{
+			string backupPath = customPath ?? _backupFilePath;
+
+			// Don't run multiple backups simultaneously
+			if (Interlocked.Exchange(ref _backupInProgress, 1) == 1)
+				return;
+
+			try
+			{
+				var backupData = new TokenBackupData();
+
+				// Create snapshots of all tokens
+				foreach (var tokenPair in _tokenTypes)
+				{
+					SharedToken token = tokenPair.Value;
+
+					lock (token.Lock)
+					{
+						// Only backup valid tokens that aren't expired
+						if (!token.IsInvalid && token.ExpiresAt > DateTime.UtcNow)
+						{
+							backupData.Tokens[tokenPair.Key] = new TokenData
+							{
+								TokenType = token.TokenType,
+								Value = token.Value,
+								ExpiresAt = token.ExpiresAt,
+								RefreshParameters = new Dictionary<string, object>(token.RefreshParameters),
+								UsageCount = token.UsageCount
+							};
+						}
+					}
+				}
+
+				// Ensure directory exists
+				string directory = Path.GetDirectoryName(backupPath);
+				if (!Directory.Exists(directory) && !string.IsNullOrEmpty(directory))
+				{
+					Directory.CreateDirectory(directory);
+				}
+
+				// Write to temp file first, then move to avoid partial writes
+				string tempFile = backupPath + ".tmp";
+				File.WriteAllText(tempFile, JsonConvert.SerializeObject(backupData, Formatting.Indented));
+
+				// Atomic replacement of the backup file
+				if (File.Exists(backupPath))
+					File.Delete(backupPath);
+				File.Move(tempFile, backupPath);
+
+				System.Diagnostics.Debug.WriteLine($"Token backup completed at {DateTime.Now}");
+			}
+			catch (Exception ex)
+			{
+				System.Diagnostics.Debug.WriteLine($"Token backup failed: {ex.Message}");
+			}
+			finally
+			{
+				_backupInProgress = 0;
+			}
+		}
+
+		/// <summary>
+		/// Restore tokens from backup file
+		/// </summary>
+		public void RestoreTokensFromBackup(string customPath = null)
+		{
+			string backupPath = customPath ?? _backupFilePath;
+
+			if (!File.Exists(backupPath))
+				return;
+
+			try
+			{
+				string json = File.ReadAllText(backupPath);
+				var backupData = JsonConvert.DeserializeObject<TokenBackupData>(json);
+
+				if (backupData == null || backupData.Tokens == null)
+					return;
+
+				// Skip if backup is too old (more than 24 hours)
+				if (DateTime.UtcNow - backupData.BackupTime > TimeSpan.FromHours(24))
+					return;
+
+				foreach (var tokenPair in backupData.Tokens)
+				{
+					string tokenType = tokenPair.Key;
+					TokenData tokenData = tokenPair.Value;
+
+					// Skip expired tokens
+					if (tokenData.ExpiresAt <= DateTime.UtcNow)
+						continue;
+
+					// Create token object
+					var token = new SharedToken
+					{
+						TokenType = tokenData.TokenType,
+						Value = tokenData.Value,
+						ExpiresAt = tokenData.ExpiresAt,
+						UsageCount = tokenData.UsageCount,
+						IsRefreshing = false,
+						IsInvalid = false
+					};
+
+					// Add refresh parameters
+					if (tokenData.RefreshParameters != null)
+					{
+						token.RefreshParameters = new Dictionary<string, object>(tokenData.RefreshParameters);
+					}
+
+					// Add to token dictionary if it doesn't exist or replace if current token is expired
+					_tokenTypes.AddOrUpdate(tokenType, token, (key, existingToken) =>
+					{
+						lock (existingToken.Lock)
+						{
+							// Only replace if existing token is invalid or expired
+							if (existingToken.IsInvalid || existingToken.ExpiresAt <= DateTime.UtcNow)
+								return token;
+							return existingToken;
+						}
+					});
+				}
+
+				System.Diagnostics.Debug.WriteLine($"Restored {backupData.Tokens.Count} tokens from backup");
+			}
+			catch (Exception ex)
+			{
+				System.Diagnostics.Debug.WriteLine($"Token restore failed: {ex.Message}");
+			}
+		}
+
+		// Implement IDisposable to properly clean up resources, and the backup timer
+		public void Dispose()
+		{
+			_backupTimer?.Dispose();
+		}
+
+		/// <summary>
+		/// Force an immediate backup of all tokens to file storage
+		/// </summary>
+		/// <param name="path">Optional custom path for the backup file</param>
+		/// <returns>True if backup was successful</returns>
+		public bool ForceBackup(string path = null)
+        {
+            try
+            {
+                BackupTokensToFile(path);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Force backup failed: {ex.Message}");
+                return false;
+            }
+        }
 	}
 
 	/// <summary>
@@ -512,6 +728,14 @@ namespace TokenManagement
 				_disposed = true;
 			}
 		}
+
+        /// <summary>
+        /// Force a backup of all tokens to file storage
+        /// </summary>
+        public bool ForceBackup(string path = null)
+        {
+            return AnonymousPrincipal.Instance.ForceBackup(path);
+        }
 	}
 
 	/// <summary>
@@ -567,6 +791,28 @@ namespace TokenManagement
 				}
 			}
 		}
+
+        /// <summary>
+        /// Force a backup of all tokens to file storage
+        /// </summary>
+        /// <param name="path">Optional custom path for the backup file</param>
+        /// <returns>True if backup was successful</returns>
+        public static bool ForceTokenBackup(string path = null)
+        {
+            return AnonymousPrincipal.Instance.ForceBackup(path);
+        }
+
+        /// <summary>
+        /// Clean up on application shutdown
+        /// </summary>
+        public static void CleanupOnShutdown()
+        {
+            // Backup tokens before shutting down
+            ForceTokenBackup();
+            
+            // Dispose the singleton instance
+            (AnonymousPrincipal.Instance as IDisposable)?.Dispose();
+        }
 	}
 
 	/// <summary>
@@ -595,9 +841,12 @@ namespace TokenManagement
 			}
 		}
 
-		public static void StopCleanupTask()
-		{
-			_cleanupTimer?.Dispose();
-		}
+        public static void StopCleanupTask()
+        {
+            _cleanupTimer?.Dispose();
+            
+            // Backup tokens before stopping the cleanup task
+            AnonymousTokenHelper.ForceTokenBackup();
+        }
 	}
 }
